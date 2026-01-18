@@ -1,23 +1,48 @@
 #!/usr/bin/env python3
 """Simple Markdown to HTML converter (writes HTML fragments only).
+
+Design notes:
+- Produces HTML fragments only (no <html>/<head>/<body> wrapper).
+- Lightweight, dependency-free: uses regular expressions and line-based parsing.
+- Supports headings, paragraphs, bold/italic/link inline formatting,
+  unordered/ordered lists, fenced code blocks (```), horizontal rules,
+  and a basic GitHub-style table detection.
+
 Usage: python3 markdown_to_html.py input.txt output.txt
 """
 import re
 import sys
 
+# Regular expressions for simple inline markdown features.
+# These are intentionally simple and cover common cases (not full CommonMark).
 BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 ITALIC_RE = re.compile(r"\*(.+?)\*")
 LINK_RE = re.compile(r"\[(.*?)\]\((.*?)\)")
 
 
 def inline_replace(text):
+    """Replace inline markdown (bold, italic, links) in a text line.
+
+    Note: order matters (bold before italic) to avoid clobbering markers.
+    This function does not escape HTML — assume trusted/simple inputs.
+    """
+    # Bold first (strong)
     text = BOLD_RE.sub(r"<strong>\1</strong>", text)
+    # Then italic (em)
     text = ITALIC_RE.sub(r"<em>\1</em>", text)
+    # Then links [text](url)
     text = LINK_RE.sub(r"<a href=\"\2\">\1</a>", text)
     return text
 
 
 def convert(lines):
+    """Convert a list of input lines (strings) from markdown to HTML fragment.
+
+    High-level approach:
+    - Iterate lines with an index so we can peek ahead for tables.
+    - Maintain small parser state: in_code, current list type, paragraph buffer.
+    - Emit tags for headings, lists, tables, and code blocks as encountered.
+    """
     out = []
     in_code = False
     code_buffer = []
@@ -25,12 +50,18 @@ def convert(lines):
     para_buffer = []
 
     def flush_para():
+        """Flush an accumulated paragraph buffer into a single <p> element.
+
+        Paragraph lines are joined with spaces (preserve words across wrapped
+        lines in the source). After flushing, the buffer is cleared.
+        """
         nonlocal para_buffer
         if para_buffer:
             out.append("<p>" + inline_replace(" ".join(para_buffer).strip()) + "</p>")
             para_buffer = []
 
     def close_list():
+        """Close any open list (</ul> or </ol>) and reset state."""
         nonlocal list_type
         if list_type:
             out.append(f"</{list_type}>")
@@ -42,13 +73,16 @@ def convert(lines):
         raw = lines[i]
         line = raw.rstrip('\n')
 
+        # Fenced code block start/end
         if line.strip().startswith("```"):
             if not in_code:
+                # Starting a code block: close running paragraphs/lists first
                 flush_para()
                 close_list()
                 in_code = True
                 code_buffer = []
             else:
+                # Ending a code block: emit the collected lines unchanged
                 out.append("<pre><code>")
                 out.extend([c for c in code_buffer])
                 out.append("</code></pre>")
@@ -57,18 +91,20 @@ def convert(lines):
             i += 1
             continue
 
+        # Inside a fenced code block: collect raw lines until closing ```
         if in_code:
             code_buffer.append(line)
             i += 1
             continue
 
+        # Blank line => end current paragraph or list
         if not line.strip():
             flush_para()
             close_list()
             i += 1
             continue
 
-        # headings
+        # Headings: lines starting with 1-6 '#' characters
         m = re.match(r"^(#{1,6})\s+(.*)$", line)
         if m:
             flush_para()
@@ -78,7 +114,7 @@ def convert(lines):
             i += 1
             continue
 
-        # horizontal rule
+        # Horizontal rule (e.g. '---' or '***') on a line by itself
         if re.match(r"^(-{3,}|\*{3,}|_{3,})$", line.strip()):
             flush_para()
             close_list()
@@ -86,7 +122,7 @@ def convert(lines):
             i += 1
             continue
 
-        # unordered list
+        # Unordered list item (lines starting with '-' or '*')
         m = re.match(r"^\s*[-\*]\s+(.*)$", line)
         if m:
             flush_para()
@@ -98,7 +134,7 @@ def convert(lines):
             i += 1
             continue
 
-        # ordered list
+        # Ordered list item (e.g. '1. item')
         m = re.match(r"^\s*\d+\.\s+(.*)$", line)
         if m:
             flush_para()
@@ -110,9 +146,11 @@ def convert(lines):
             i += 1
             continue
 
-        # table detection: header line with '|' and next line is a separator like |---|---|
+        # Basic table detection: a line containing '|' followed by a separator
+        # line such as '| --- | --- |'. This implements a simple GitHub-style
+        # table parser: header row -> separator row -> body rows.
         if '|' in line:
-            # Peek next non-empty line
+            # Peek next non-empty line to see if it looks like a table separator
             j = i + 1
             while j < n and not lines[j].strip():
                 j += 1
@@ -120,7 +158,7 @@ def convert(lines):
                 sep = lines[j].strip()
                 # separator should contain only pipes, colons, dashes, and spaces
                 if re.match(r"^\s*[:\-\| \t]+$", sep) and re.search(r"-{3,}", sep):
-                    # It's a table
+                    # It's a table: emit <table>, <thead>, and <tbody>
                     flush_para()
                     close_list()
                     header_line = line.strip().strip('|')
@@ -131,7 +169,7 @@ def convert(lines):
                     out.append("</thead>")
                     out.append("<tbody>")
                     i = j + 1
-                    # consume rows until a blank line or non-table line
+                    # consume rows until a blank line or a line without '|' character
                     while i < n and lines[i].strip():
                         row = lines[i].strip()
                         if '|' not in row:
@@ -143,15 +181,16 @@ def convert(lines):
                     out.append("</table>")
                     continue
 
-        # paragraphs (accumulate until blank line)
-        para_buffer.append(line.strip())
-        i += 1
+    # Fallback: accumulate paragraph lines until a blank line
+    para_buffer.append(line.strip())
+    i += 1
 
     # end while
     flush_para()
     close_list()
 
-    # If file ended while still in code block, close it safely
+    # If file ended while still in code block, close it safely so output is
+    # well-formed. This mirrors the behavior of closing a fenced block above.
     if in_code:
         out.append("<pre><code>")
         out.extend([c for c in code_buffer])

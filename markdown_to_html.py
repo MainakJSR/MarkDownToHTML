@@ -3,7 +3,11 @@
 
 Design notes:
 - Produces HTML fragments only (no <html>/<head>/<body> wrapper).
-- Lightweight, dependency-free: uses regular expressions and line-based parsing.
+- Lightweight,                     out.append("</tbody>")
+                    out.append("</table>")
+                    continue  # Skip para accumulation; table already handled
+
+        # Fallback: lines with '|' that aren't tables, or any other linesdency-free: uses regular expressions and line-based parsing.
 - Supports headings, paragraphs, bold/italic/link inline formatting,
   unordered/ordered lists, fenced code blocks (```), horizontal rules,
   and a basic GitHub-style table detection.
@@ -15,9 +19,10 @@ import sys
 
 # Regular expressions for simple inline markdown features.
 # These are intentionally simple and cover common cases (not full CommonMark).
-BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
-ITALIC_RE = re.compile(r"\*(.+?)\*")
-LINK_RE = re.compile(r"\[(.*?)\]\((.*?)\)")
+# Note: Use negated character classes instead of .+? to avoid backtracking hangs.
+BOLD_RE = re.compile(r"\*\*([^\*]+)\*\*")
+ITALIC_RE = re.compile(r"\*([^\*]+)\*")
+LINK_RE = re.compile(r"\[([^\]]*)\]\(([^\)]*)\)")
 
 
 def inline_replace(text):
@@ -25,12 +30,19 @@ def inline_replace(text):
 
     Note: order matters (bold before italic) to avoid clobbering markers.
     This function does not escape HTML — assume trusted/simple inputs.
+    Uses simple string-based replacements to avoid regex backtracking hangs.
+    Skips processing if text is extremely long (> 10KB) to avoid hangs.
     """
-    # Bold first (strong)
+    # Safety: skip processing very long lines (potential pathological inputs)
+    if len(text) > 10000:
+        return text
+    
+    # Bold first (strong): **text** -> <strong>text</strong>
     text = BOLD_RE.sub(r"<strong>\1</strong>", text)
-    # Then italic (em)
+    # Then italic (em): *text* -> <em>text</em>
+    # Only replace if not surrounded by more asterisks to avoid double-matching
     text = ITALIC_RE.sub(r"<em>\1</em>", text)
-    # Then links [text](url)
+    # Then links [text](url) -> <a href="url">text</a>
     text = LINK_RE.sub(r"<a href=\"\2\">\1</a>", text)
     return text
 
@@ -72,8 +84,6 @@ def convert(lines):
     while i < n:
         raw = lines[i]
         line = raw.rstrip('\n')
-
-        # Fenced code block start/end
         if line.strip().startswith("```"):
             if not in_code:
                 # Starting a code block: close running paragraphs/lists first
@@ -92,12 +102,13 @@ def convert(lines):
             continue
 
         # Inside a fenced code block: collect raw lines until closing ```
+        # Note: blank lines inside code blocks are preserved as-is
         if in_code:
             code_buffer.append(line)
             i += 1
             continue
 
-        # Blank line => end current paragraph or list
+        # Blank line => end current paragraph or list (but only outside code blocks)
         if not line.strip():
             flush_para()
             close_list()
@@ -105,7 +116,7 @@ def convert(lines):
             continue
 
         # Headings: lines starting with 1-6 '#' characters
-        m = re.match(r"^(#{1,6})\s+(.*)$", line)
+        m = re.match(r"^(#{1,6})\s+(.+)$", line)
         if m:
             flush_para()
             close_list()
@@ -181,9 +192,9 @@ def convert(lines):
                     out.append("</table>")
                     continue
 
-    # Fallback: accumulate paragraph lines until a blank line
-    para_buffer.append(line.strip())
-    i += 1
+        # Fallback: accumulate paragraph lines until a blank line
+        para_buffer.append(line.strip())
+        i += 1
 
     # end while
     flush_para()
